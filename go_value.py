@@ -723,9 +723,9 @@ $demo_banner
 $privacy_filter
 $unmatched
 $privacy_callout
-<div class="cards cards-all">
+<div class="cards cards-all"$cards_all_style>
 $cards
-</div><div class="cards cards-notrain" style="display:none">
+</div><div class="cards cards-notrain"$cards_notrain_style>
 $cards_notrain
 </div>
 <p><b>BANG</b> is this report's composite score: <code>quality<sup>0.7</sup> &times; quota-value<sup>0.3</sup></code>, where quality is the raw
@@ -756,7 +756,7 @@ $tbody
 <dt>AA intell. / tok/s</dt><dd>Artificial Analysis intelligence index and median output speed (tokens/s). Higher is better; the index goes 0&ndash;100 and measures general reasoning ability.</dd>
 <dt>BANG</dt><dd>The bang-for-buck score explained above (0&ndash;100, higher is better value). Quality enters as the raw AA intelligence index, quota as the saturating quota-value (bottleneck of both windows).</dd>
 <dt>Match</dt><dd>Confidence the AA scores shown belong to this exact model: <b>exact</b> name match, <b>fuzzy</b> (name variant, e.g. publisher prefix), <b>none</b> (no AA data yet, or only an unverified guess which is never scored).</dd>
-<dt>Privacy</dt><dd>From the Go docs <i>Privacy</i> table: whether the provider trains models on your prompts, plus data retention. The checkbox above swaps charts, cards and leaderboard rows to versions without the flagged <b>trains</b> models.</dd>
+<dt>Privacy</dt><dd>From the Go docs <i>Privacy</i> table: whether the provider trains models on your prompts, plus data retention. The checkbox above (on by default) swaps charts, cards and leaderboard rows to versions without the flagged <b>trains</b> models.</dd>
 </dl>
 <footer>
 Sources: <a href="https://opencode.ai/docs/go/">OpenCode Go docs</a> &amp; the <code>zen/go/v1/models</code> endpoint
@@ -829,7 +829,12 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
 
     # charts -> concatenated <h2>+<img>+<caption> html, grouped by title.
     # Each chart pairs the full-data PNG with its training-excluded twin
-    # (when present); the checkbox swaps the two via JS.
+    # (when present); the checkbox (checked by default) swaps the two via JS.
+    # default_hide is True when a filtered view exists, so the initial HTML
+    # already shows the filtered view (correct even with JS disabled); the
+    # JS syncs to the checkbox state on load/pageshow.
+    default_hide = any(r.trains for r in rows) and any(not r.trains for r in rows)
+
     def chart_img(c, extra_cls, hidden):
         try:
             with open(c["path"], "rb") as f:
@@ -853,9 +858,9 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
         pair = grouped[title]
         if "all" not in pair:
             continue
-        imgs = chart_img(pair["all"], "chart-all", False)
+        imgs = chart_img(pair["all"], "chart-all", default_hide if "notrain" in pair else False)
         if "notrain" in pair:
-            imgs += chart_img(pair["notrain"], "chart-notrain", True)
+            imgs += chart_img(pair["notrain"], "chart-notrain", not default_hide)
         if not imgs:
             continue
         charts_html += (
@@ -922,7 +927,8 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
                 ret = f"retention: {esc(r.retention)}" if r.retention else "no training per Go docs"
                 priv = f'<span class="badge ok" title="{ret}">no train</span>'
             body.append(
-                f'<tr{" class=\"top\"" if i <= 3 else ""}{" data-trains=\"1\"" if r.trains else ""}>'
+                f'<tr{" class=\"top\"" if i <= 3 else ""}{" data-trains=\"1\"" if r.trains else ""}'
+                f'{" style=\"display:none\"" if r.trains and default_hide else ""}>'
                 f'<td class="l">{i}</td>'
                 f'<td class="l name" data-v="{esc(r.name.lower())}">{esc(r.name)}</td>'
                 f'<td class="l" data-v="{conf_rank}">{badge}</td>'
@@ -964,13 +970,14 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
             for r in training)
         privacy_callout = (f'<div class="callout"><b>{len(training)} model(s) use your prompts '
                            f'to train future models</b> (per the Go docs <i>Privacy</i> table):<ul>{items}</ul>'
-                           f'Tick the checkbox above to hide them from the charts, cards and leaderboards, or re-run with '
+                           f'They are hidden from the charts, cards and leaderboards by default &mdash; '
+                           f'untick the checkbox above to show them, or re-run with '
                            f'<code>--exclude-training</code> to drop them from the whole report.</div>')
-        privacy_filter = (f'<div class="privbar"><input type="checkbox" id="hide-train">'
+        privacy_filter = (f'<div class="privbar"><input type="checkbox" id="hide-train" checked>'
                           f'<label for="hide-train">Hide the <b>{len(training)} model(s)</b> that train '
                           f'on your data (Go docs <i>Privacy</i> table)</label></div>'
-                          f'<p class="mbnote">The checkbox swaps the charts, top-value cards and leaderboard rows '
-                          f'to versions without the flagged models. Re-run with '
+                          f'<p class="mbnote">The checkbox is on by default, showing versions without the '
+                          f'flagged models &mdash; untick to show them. Re-run with '
                           f'<code>--exclude-training</code> to drop them from the whole report.</p>')
     elif excluded_training:
         privacy_callout = ""
@@ -991,6 +998,8 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
         go_src=esc(go_src),
         generated=time.strftime("%Y-%m-%d %H:%M"),
         cards=cards, cards_notrain=cards_notrain,
+        cards_all_style=' style="display:none"' if default_hide else "",
+        cards_notrain_style="" if default_hide else ' style="display:none"',
         charts=charts_html, tbody=tbody,
     )
     with open(path, "w") as f:
