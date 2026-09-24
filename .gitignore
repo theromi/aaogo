@@ -1,0 +1,11 @@
+# Generated output from go_value.py - do not commit
+*_report.html
+*_data.json
+*_intell_vs_requests*.png
+*_bang_for_buck*.png
+*.csv
+
+# Python / macOS junk
+__pycache__/
+*.pyc
+.DS_Store
