@@ -971,18 +971,16 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
         privacy_callout = (f'<div class="callout"><b>{len(training)} model(s) use your prompts '
                            f'to train future models</b> (per the Go docs <i>Privacy</i> table):<ul>{items}</ul>'
                            f'They are hidden from the charts, cards and leaderboards by default &mdash; '
-                           f'untick the checkbox above to show them, or re-run with '
-                           f'<code>--exclude-training</code> to drop them from the whole report.</div>')
+                           f'untick the checkbox above to show them.</div>')
         privacy_filter = (f'<div class="privbar"><input type="checkbox" id="hide-train" checked>'
                           f'<label for="hide-train">Hide the <b>{len(training)} model(s)</b> that train '
                           f'on your data (Go docs <i>Privacy</i> table)</label></div>'
                           f'<p class="mbnote">The checkbox is on by default, showing versions without the '
-                          f'flagged models &mdash; untick to show them. Re-run with '
-                          f'<code>--exclude-training</code> to drop them from the whole report.</p>')
+                          f'flagged models &mdash; untick to show them.</p>')
     elif excluded_training:
         privacy_callout = ""
         privacy_filter = ('<p class="mbnote">Models that train on your data were excluded '
-                          'with <code>--exclude-training</code>.</p>')
+                          'from this report.</p>')
     else:
         privacy_callout = ""
         privacy_filter = ""
