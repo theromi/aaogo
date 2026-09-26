@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Compare OpenCode Go models by Artificial Analysis quality vs Go usage limits.
 
-Combines the OpenCode Go model list / usage limits (parsed fresh from
-https://opencode.ai/docs/go/#usage-limits on every run, and cross-checked
-against the live endpoint https://opencode.ai/zen/go/v1/models) with
-benchmark data from the Artificial Analysis free API
+Combines the OpenCode Go model list / usage limits (parsed fresh from the
+upstream docs MDX https://opencode.ai/docs/go/#usage-limits on every run —
+the docs tables are the source of truth — and cross-checked against the live
+endpoint https://opencode.ai/zen/go/v1/models) with benchmark data from the
+Artificial Analysis free API
 (https://artificialanalysis.ai/api/v2/data/llms/models, key required).
 
 Data source attribution (required by AA ToS): https://artificialanalysis.ai/
@@ -52,16 +53,20 @@ from string import Template
 class GoModel:
     id: str                 # model id on opencode.ai/zen/go (config: opencode-go/<id>)
     name: str               # display name in docs
-    req_5h: int             # allowed requests per 5 hours
-    req_week: int           # allowed requests per week
-    req_month: int          # allowed requests per month
-    price_in: float         # $/1M uncached input tokens
-    price_out: float        # $/1M output tokens
-    price_cache: float      # $/1M cached-read tokens
-    tok_in: int             # typical input tokens per request
-    tok_cache: int          # typical cached tokens per request
-    tok_out: int            # typical output tokens per request
-    usage_usd: float        # included usage value per month (per-model $ tier)
+    # Quotas: int, math.inf for docs "Unlimited" promo rows, None when the
+    # docs publish no limit (e.g. endpoint-only models not yet documented).
+    req_5h: int | float | None
+    req_week: int | float | None
+    req_month: int | float | None
+    price_in: float | None         # $/1M uncached input tokens (0.0 == Free)
+    price_out: float | None        # $/1M output tokens (0.0 == Free)
+    price_cache: float | None      # $/1M cached-read tokens (0.0 == Free)
+    # Token profile: None when the docs publish no typical-request mix yet.
+    tok_in: int | None
+    tok_cache: int | None
+    tok_out: int | None
+    # math.inf for docs "Unlimited" monthly value, None when unpublished.
+    usage_usd: float | None
     notes: str = ""
     aa_hint: str = ""       # optional Artificial Analysis slug/name override
     trains: bool = False    # docs ## Privacy table: model trains on your prompts
@@ -71,7 +76,7 @@ ZEN_MODELS_URL = "https://opencode.ai/zen/go/v1/models"
 # Live docs source (upstream OpenCode docs). Override with --go-docs-url
 # only if upstream moves. No fallback snapshot exists: a failed fetch
 # is a fatal error so reports never reflect stale data.
-GO_DOCS_MDX_URL = ("https://raw.githubusercontent.com/anomalyco/opencode/dev/"
+GO_DOCS_MDX_URL = ("https://raw.githubusercontent.com/sst/opencode/dev/"
                    "packages/web/src/content/docs/go.mdx")
 AA_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 AA_ATTRIBUTION = "Benchmarks: artificialanalysis.ai"
@@ -127,8 +132,12 @@ def demo_aa_models(catalog):
     The Go catalog itself is still fetched live; only the AA benchmarks are synthetic."""
     # Omit quota extremes so the unmatched path is always exercised,
     # without hardcoding any model id (catalog is live and rotates).
+    # Only finite quotas participate (Unlimited/unpublished stay unscored).
     skip_ids = set()
-    by_quota = sorted(catalog, key=lambda g: g.req_month)
+    finite = [g for g in catalog
+              if g.req_month is not None
+              and not (isinstance(g.req_month, float) and math.isinf(g.req_month))]
+    by_quota = sorted(finite, key=lambda g: g.req_month)
     for gm in ([by_quota[0]] + by_quota[-1:] if by_quota else []):
         skip_ids.add(gm.id)
         if len(skip_ids) >= 2:
@@ -178,10 +187,27 @@ def _parse_int(s):
     return int(s) if re.fullmatch(r"\d+", s) else None
 
 
+def _is_unlimited_cell(s):
+    return s.strip().lower() == "unlimited"
+
+
+def _parse_quota_cell(s):
+    """Parse a request-limit cell: int, math.inf for "Unlimited", or None
+    when the cell is genuinely unparseable (caller must skip the row)."""
+    if _is_unlimited_cell(s):
+        return math.inf
+    return _parse_int(s)
+
+
 def _parse_money(s):
     # Docs wrap the monthly limit as **$60** (bold) — strip markdown first.
-    s = s.replace("$", "").replace(",", "").strip().strip("*_`").strip()
-    return float(s) if re.fullmatch(r"[\d.]+", s) else None
+    # Promo rows use "Free" for $0 and "Unlimited" for uncapped value.
+    t = s.replace("$", "").replace(",", "").strip().strip("*_`").strip()
+    if t.lower() == "free":
+        return 0.0
+    if t.lower() == "unlimited":
+        return math.inf
+    return float(t) if re.fullmatch(r"[\d.]+", t) else None
 
 
 def _md_tables(text):
@@ -245,7 +271,10 @@ def parse_go_catalog(mdx):
         elif c5 is not None and cm is not None:
             for r in rows:
                 name = re.sub(r"\s*\([^()]*\)\s*$", "", r[0]).strip()
-                vals = [_parse_int(r[c] if c is not None and c < len(r) else "") for c in (c5, col("per week"), cm)]
+                vals = [_parse_quota_cell(r[c] if c is not None and c < len(r) else "")
+                        for c in (c5, col("per week"), cm)]
+                # "Unlimited" promo cells parse to math.inf and are kept;
+                # only genuinely unparseable rows are dropped here.
                 if all(v is not None for v in vals):
                     reqs[name] = tuple(vals)
         elif col("input") is not None and col("cached read") is not None and c_usage is not None:
@@ -256,13 +285,15 @@ def parse_go_catalog(mdx):
                     continue
                 pin, pout, pcr, usage = (_parse_money(r[c]) if c < len(r) else None
                                          for c in (col("input"), col("output"), col("cached read"), c_usage))
+                # "Free" parses to 0.0 and is kept; only genuinely
+                # unparseable price cells are skipped.
                 if None in (pin, pout, pcr):
                     continue
                 # Docs may list several tiers for one base model; keep cheapest.
                 prev = prices.get(base)
                 if prev is not None and (prev[0], prev[1]) <= (pin, pout):
                     continue
-                prices[base] = (pin, pout, pcr, usage or 0.0)
+                prices[base] = (pin, pout, pcr, usage if usage is not None else 0.0)
                 if suffix:
                     notes[base] = "off-peak pricing" if "off-peak" in suffix.lower() else f"{suffix} tier"
         elif col("model id") is not None:
@@ -282,6 +313,7 @@ def parse_go_catalog(mdx):
     price_idx = {key(k): (k, v) for k, v in prices.items()}
     id_idx = {key(k): (k, v) for k, v in ids.items()}
     priv_idx = {key(k): (k, v) for k, v in privacy.items()}
+    req_idx = {key(k): (k, v) for k, v in reqs.items()}
 
     def lookup(idx, k):
         if k in idx:
@@ -299,22 +331,63 @@ def parse_go_catalog(mdx):
         k = key(name)
         pf, pf_exact, _ = lookup(prof_idx, k)
         pr, pr_exact, pr_orig = lookup(price_idx, k)
-        if not pf or not pr:
+        if pr is None and pf is None:
+            # Request limits published but neither price nor token profile
+            # (yet) — keep the model as unscored instead of dropping it.
             skipped.append(name)
-            continue
         mid = lookup(id_idx, k)[0] or re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-")
         note = notes.get(pr_orig or "", "")
-        if not pf_exact or not pr_exact:
+        if pr is None and pf is None:
+            note = "; ".join(filter(None, [
+                note, "no published price or token profile in docs yet — unscored"]))
+        elif pr is None:
+            note = "; ".join(filter(None, [
+                note, "no published price in docs yet — unscored"]))
+        elif pf is None:
+            note = "; ".join(filter(None, [
+                note, "no published token profile in docs yet — tokens/mo n/a"]))
+        elif not pf_exact or not pr_exact:
             note = "; ".join(filter(None, [note, "docs tables joined fuzzily — verify"]))
+        if any(isinstance(v, float) and math.isinf(v) for v in (r5, rw, rm)):
+            note = "; ".join(filter(None, [note, "Free · Unlimited (limited-time promo)"]))
         pv, _, _ = lookup(priv_idx, k)
         if pv is None:
             missing_priv.append(name)
         trains, retention = pv if pv is not None else (False, "")
-        models.append(GoModel(id=mid, name=name, req_5h=r5, req_week=rw, req_month=rm,
-                              price_in=pr[0], price_out=pr[1], price_cache=pr[2],
-                              tok_in=pf[0], tok_cache=pf[1], tok_out=pf[2],
-                              usage_usd=pr[3], notes=note,
-                              trains=trains, retention=retention))
+        models.append(GoModel(
+            id=mid, name=name, req_5h=r5, req_week=rw, req_month=rm,
+            price_in=pr[0] if pr else None,
+            price_out=pr[1] if pr else None,
+            price_cache=pr[2] if pr else None,
+            tok_in=pf[0] if pf else None,
+            tok_cache=pf[1] if pf else None,
+            tok_out=pf[2] if pf else None,
+            usage_usd=pr[3] if pr else None, notes=note,
+            trains=trains, retention=retention))
+    # Docs sometimes publish prices/ids before request limits (or vice
+    # versa). Add any price-table model missing from the request table so
+    # new models never silently vanish; they stay unscored until limits land.
+    covered = {key(m.name) for m in models}
+    for base, pr in prices.items():
+        k = key(base)
+        if k in covered:
+            continue
+        # Already fuzzy-joined to a request-table model above — skip.
+        if lookup(req_idx, k)[0] is not None:
+            continue
+        mid = lookup(id_idx, k)[0] or re.sub(r"[^a-z0-9.]+", "-", base.lower()).strip("-")
+        pf, _, _ = lookup(prof_idx, k)
+        pv, _, _ = lookup(priv_idx, k)
+        trains, retention = pv if pv is not None else (False, "")
+        models.append(GoModel(
+            id=mid, name=base, req_5h=None, req_week=None, req_month=None,
+            price_in=pr[0], price_out=pr[1], price_cache=pr[2],
+            tok_in=pf[0] if pf else None,
+            tok_cache=pf[1] if pf else None,
+            tok_out=pf[2] if pf else None,
+            usage_usd=pr[3], notes="no published request limits in docs yet — unscored",
+            trains=trains, retention=retention))
+        covered.add(k)
     if not privacy:
         print("[go] warning: no ## Privacy table parsed — training flags default to False",
               file=sys.stderr)
@@ -341,7 +414,8 @@ def fetch_go_catalog(url=GO_DOCS_MDX_URL):
                  f"  Source: {url}\n"
                  "  Network access is required — no offline snapshot exists.")
     if skipped:
-        print(f"[go] warning: docs limit rows without matching price or token-profile (excluded): {', '.join(skipped)}")
+        print(f"[go] warning: docs limit rows without matching price AND token-profile "
+              f"(kept unscored): {', '.join(skipped)}")
     print(f"[go] catalog: parsed {len(models)} models from live docs MDX")
     return models, f"live OpenCode Go docs ({time.strftime('%Y-%m-%d %H:%M')})"
 
@@ -470,12 +544,13 @@ def match_one(go_model, aa_models, overrides):
 class Row:
     id: str
     name: str
-    req_5h: int
-    req_week: int
-    req_month: int
-    cost_req: float          # $ per typical request at Go prices
-    value_mult: float        # included usage $ / subscription price
-    tokens_month: float      # est. total tokens/month the request limits allow
+    # int, math.inf ("Unlimited" promo) or None (no published limits yet).
+    req_5h: int | float | None
+    req_week: int | float | None
+    req_month: int | float | None
+    cost_req: float | None          # $ per typical request at Go prices
+    value_mult: float | None        # included usage $ / subscription price
+    tokens_month: float | None      # est. total tokens/month the request limits allow
     aa_name: str
     match_quality: str
     intelligence: float | None
@@ -518,7 +593,9 @@ def quota_value(req, k, peak):
     peak, then minus QUOTA_DECAY points per 10x over peak. Scarce quota gains
     almost linearly, generous quota plateaus, absurd quota gently degrades —
     still no hard cap, v just stops rewarding excess."""
-    if req is None or req <= 0:
+    if req is None or (isinstance(req, float) and math.isinf(req)) or req <= 0:
+        # Unlimited promos and unpublished limits are listed but never scored:
+        # there is no fair finite quota to rank them on.
         return None
     v = 100.0 * req / (req + k)
     if req > peak:
@@ -550,7 +627,31 @@ def score_rows(rows):
 # --------------------------------------------------------------------------
 
 def fmt_num(x, spec=","):
-    return f"{x:{spec}.0f}" if x is not None else "—"
+    if x is None:
+        return "—"
+    if isinstance(x, float) and math.isinf(x):
+        return "∞"
+    return f"{x:{spec}.0f}"
+
+
+def fmt_money_per_req(x):
+    if x is None:
+        return "—"
+    if isinstance(x, float) and math.isinf(x):
+        return "∞"
+    return f"{x:.4f}"
+
+
+def fmt_mult(x):
+    if x is None:
+        return "—"
+    if isinstance(x, float) and math.isinf(x):
+        return "∞"
+    return f"{x:.0f}x"
+
+
+def is_finite_quota(x):
+    return x is not None and not (isinstance(x, float) and math.isinf(x))
 
 
 def fmt_tokens(x):
@@ -568,8 +669,8 @@ def print_table(rows):
         ("model", lambda r: r.name[:26], 26, "<"),
         ("req/5h", lambda r: fmt_num(r.req_5h), 7, ">"),
         ("req/mo", lambda r: fmt_num(r.req_month), 8, ">"),
-        ("$/req", lambda r: f"{r.cost_req:.4f}", 7, ">"),
-        ("val×", lambda r: f"{r.value_mult:.0f}x", 4, ">"),
+        ("$/req", lambda r: fmt_money_per_req(r.cost_req), 7, ">"),
+        ("val×", lambda r: fmt_mult(r.value_mult), 4, ">"),
         ("tok/mo", lambda r: fmt_tokens(r.tokens_month), 7, ">"),
         ("intell", lambda r: "—" if r.intelligence is None else f"{r.intelligence:.1f}", 6, ">"),
         ("t/s", lambda r: "—" if not r.tok_s else f"{r.tok_s:.0f}", 5, ">"),
@@ -606,13 +707,15 @@ def make_charts(rows, path_prefix, sub_price, demo, variant="all"):
 
     label = "intelligence index"
     fscatter, fbar = "_intell_vs_requests", "_bang_for_buck"
-    matched = [r for r in rows if r.intelligence is not None and r.req_month and r.req_month > 0]
-    excluded = [r.name for r in rows if r.intelligence is None]
+    matched = [r for r in rows
+               if r.intelligence is not None and is_finite_quota(r.req_month) and r.req_month > 0]
+    excluded = [r.name for r in rows
+                if r.intelligence is None or not is_finite_quota(r.req_month)]
 
     def footnote(fig):
         fig.text(0.01, 0.01, tag, fontsize=7, color="gray")
         if excluded:
-            fig.text(0.01, 0.033, "not plotted (no AA " + label + " data yet): "
+            fig.text(0.01, 0.033, "not plotted (no AA " + label + " data, or no finite quota yet): "
                      + ", ".join(excluded), fontsize=7.5, color="#666666")
 
     if matched:
@@ -629,7 +732,8 @@ def make_charts(rows, path_prefix, sub_price, demo, variant="all"):
         ax.plot([r.req_month for r in front], [r.intelligence for r in front],
                 "--", lw=1.2, color="gray", zorder=1, label="Pareto front (best value)")
         for r in matched:
-            size = min(320, 60 + 14 * r.value_mult)  # clamp: huge value_mult must not eat the plot
+            mult = r.value_mult if is_finite_quota(r.value_mult) else 2.0
+            size = min(320, 60 + 14 * mult)  # clamp: huge value_mult must not eat the plot
             ax.scatter(r.req_month, r.intelligence, s=size, zorder=2,
                        color=palette(0 if r in front else 1),
                        edgecolor="black", linewidth=0.5)
@@ -684,6 +788,14 @@ def make_charts(rows, path_prefix, sub_price, demo, variant="all"):
     return charts
 
 
+def _csv_cell(x, fmt=None):
+    if x is None:
+        return ""
+    if isinstance(x, float) and math.isinf(x):
+        return "Unlimited"
+    return fmt(x) if fmt else x
+
+
 def write_csv(rows, path, sub_price):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
@@ -693,9 +805,16 @@ def write_csv(rows, path, sub_price):
                     "aa_tok_per_s", "aa_ttft_s", "bang",
                     "trains_on_data", "data_retention", "notes"])
         for r in sorted(rows, key=lambda r: -(r.bang or -1)):
-            w.writerow([r.id, r.name, r.req_5h, r.req_week,
-                        r.req_month, round(r.cost_req, 6), round(r.value_mult * sub_price, 2), round(r.value_mult, 3),
-                        int(r.tokens_month), r.aa_name, r.match_quality, r.intelligence,
+            value_usd = (None if r.value_mult is None
+                         else (math.inf if isinstance(r.value_mult, float) and math.isinf(r.value_mult)
+                               else r.value_mult * sub_price))
+            w.writerow([r.id, r.name,
+                        _csv_cell(r.req_5h), _csv_cell(r.req_week), _csv_cell(r.req_month),
+                        _csv_cell(r.cost_req, lambda v: round(v, 6)),
+                        _csv_cell(value_usd, lambda v: round(v, 2)),
+                        _csv_cell(r.value_mult, lambda v: round(v, 3)),
+                        _csv_cell(r.tokens_month, lambda v: int(v)),
+                        r.aa_name, r.match_quality, r.intelligence,
                         r.tok_s or "", r.ttft_s or "", r.bang,
                         "yes" if r.trains else "no", r.retention, r.notes])
 
@@ -921,8 +1040,10 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
             return "<p>No models in catalog.</p>", ""
         matched = [r for r in vrows if r.intelligence is not None]
         scored = sorted((r for r in vrows if r.bang is not None), key=lambda r: -r.bang)
-        # Front here must match make_charts.
-        by_quota = sorted(matched, key=lambda r: r.req_month)
+        # Front here must match make_charts (finite quotas only; Unlimited /
+        # unpublished quotas are listed but never plotted or scored).
+        plottable = [r for r in matched if is_finite_quota(r.req_month)]
+        by_quota = sorted(plottable, key=lambda r: r.req_month)
         front, best_q = [], float("-inf")
         for r in reversed(by_quota):
             if r.intelligence > best_q:
@@ -930,26 +1051,41 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
                 best_q = r.intelligence
         front_ids = {r.id for r in front}
 
+        def quota_txt(x):
+            if x is None:
+                return "n/a"
+            if isinstance(x, float) and math.isinf(x):
+                return "Unlimited"
+            return f"{x:,} req/mo"
+
+        def quota_sort(x):
+            if x is None:
+                return -1.0
+            if isinstance(x, float) and math.isinf(x):
+                return math.inf
+            return float(x)
+
         cards = []
         train_note = ' <span class="badge warn" title="uses prompts to train future models">trains on data</span>'
         if scored:
             b = scored[0]
             pareto = "On the Pareto front." if b.id in front_ids else ""
             cards.append(card("Top value (BANG)", b.name,
-                              f"BANG {b.bang:.0f} &middot; intelligence {b.intelligence:.1f} &middot; {b.req_month:,} req/mo"
+                              f"BANG {b.bang:.0f} &middot; intelligence {b.intelligence:.1f} &middot; {quota_txt(b.req_month)}"
                               + (train_note if b.trains else ""),
                               f"Best balance of quality and quota. {pareto}"))
         if matched:
             t = max(matched, key=lambda r: r.intelligence)
+            t_quota = t.req_month if is_finite_quota(t.req_month) else None
             cards.append(card("Highest intelligence quality", t.name,
-                              f"intelligence index {t.intelligence:.1f} &middot; {t.req_month:,} req/mo"
+                              f"intelligence index {t.intelligence:.1f} &middot; {quota_txt(t.req_month)}"
                               + (train_note if t.trains else ""),
                               "Quality leader &mdash; but note how tight its request quota is. Pick it if you rarely "
-                              "exhaust the 5-hour window." if t.req_month < 10000 else
+                              "exhaust the 5-hour window." if (t_quota is not None and t_quota < 10000) else
                               "Smart <i>and</i> generously metered."))
-        q = max(vrows, key=lambda r: r.req_month)
+        q = max(vrows, key=lambda r: quota_sort(r.req_month))
         cards.append(card("Quota king", q.name,
-                          f"{q.req_month:,} req/mo &middot; " + ("quality n/a" if q.intelligence is None else f"intelligence {q.intelligence:.1f}")
+                          f"{quota_txt(q.req_month)} &middot; " + ("quality n/a" if q.intelligence is None else f"intelligence {q.intelligence:.1f}")
                           + (train_note if q.trains else ""),
                           "You will run out of subscription months before you run out of requests here."))
 
@@ -961,13 +1097,33 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
             badge = f'<span class="badge {cls}" title="match confidence">{q_txt}</span>'
             if r.aa_name.startswith("suggested: "):
                 badge += f' <span class="sugg">&asymp; {esc(r.aa_name[11:])}?</span>'
-            val = f"${r.value_mult * sub_price:g}&nbsp;({r.value_mult:.0f}&times;)"
+            if r.value_mult is None:
+                val = "&mdash;"
+                val_sort = ""
+            elif isinstance(r.value_mult, float) and math.isinf(r.value_mult):
+                val = "Unlimited"
+                val_sort = "inf"
+            else:
+                val = f"${r.value_mult * sub_price:g}&nbsp;({r.value_mult:.0f}&times;)"
+                val_sort = f"{r.value_mult * sub_price:.4g}"
             sv = r.bang
             num = lambda x: "&mdash;" if x is None else f"{x:.1f}"
             bang_cls = ' class="bang"' if sv is not None else ""
             bang = f"{sv:.0f}" if sv is not None else "&mdash;"
             conf_rank = {"ok": 0, "warn": 1, "bad": 2}[cls]
             dv_int = "" if r.intelligence is None else f"{r.intelligence:.1f}"
+            def qcell(x):
+                if x is None:
+                    return "", "&mdash;"
+                if isinstance(x, float) and math.isinf(x):
+                    return "inf", "Unlimited"
+                return f"{x:.0f}", f"{x:,}"
+            sv5, txt5 = qcell(r.req_5h)
+            svm, txtm = qcell(r.req_month)
+            if r.cost_req is None:
+                cost_sort, cost_txt = "", "&mdash;"
+            else:
+                cost_sort, cost_txt = f"{r.cost_req:.6f}", f"{r.cost_req:.4f}"
             if r.trains:
                 ret = esc(r.retention) if r.retention else "unknown"
                 priv = (f'<span class="badge warn" title="uses prompts to train future models &middot; '
@@ -982,11 +1138,11 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
                 f'<td class="l name" data-v="{esc(r.name.lower())}">{esc(r.name)}</td>'
                 f'<td class="l" data-v="{conf_rank}">{badge}</td>'
                 f'<td class="l" data-v="{1 if r.trains else 0}">{priv}</td>'
-                f'<td data-v="{r.req_5h}">{r.req_5h:,}</td>'
-                f'<td data-v="{r.req_month}">{r.req_month:,}</td>'
-                f'<td data-v="{r.cost_req:.6f}">{r.cost_req:.4f}</td>'
-                f'<td data-v="{r.value_mult * sub_price:.4g}">{val}</td>'
-                f'<td data-v="{r.tokens_month:.0f}">{fmt_tokens(r.tokens_month)}</td>'
+                f'<td data-v="{sv5}">{txt5}</td>'
+                f'<td data-v="{svm}">{txtm}</td>'
+                f'<td data-v="{cost_sort}">{cost_txt}</td>'
+                f'<td data-v="{val_sort}">{val}</td>'
+                f'<td data-v="{"" if r.tokens_month is None else f"{r.tokens_month:.0f}"}">{fmt_tokens(r.tokens_month)}</td>'
                 f'<td data-v="{dv_int}">{num(r.intelligence)}</td>'
                 f'<td data-v="{"" if not r.tok_s else f"{r.tok_s:.1f}"}">{"&mdash;" if not r.tok_s else f"{r.tok_s:.0f}"}</td>'
                 f'<td{bang_cls} data-v="{"" if sv is None else f"{sv:.1f}"}">{bang}</td></tr>')
@@ -1002,8 +1158,14 @@ def write_html(rows, charts, sub_price, demo, go_src, path, excluded_training=Fa
 
     missing_aa = [r for r in rows if r.intelligence is None]
     if missing_aa:
+        def _quota_li(r):
+            if r.req_month is None:
+                return "no published limits yet"
+            if isinstance(r.req_month, float) and math.isinf(r.req_month):
+                return "Unlimited promo"
+            return f"{r.req_month:,} req/mo included"
         items = "".join(
-            f'<li><b>{esc(r.name)}</b> ({r.req_month:,} req/mo included)'
+            f'<li><b>{esc(r.name)}</b> ({_quota_li(r)})'
             + (f' &mdash; AA has no benchmark entry yet; possibly <b>{esc(r.aa_name[11:])}</b>?'
                if r.aa_name.startswith("suggested: ") else " &mdash; AA has no benchmark entry yet")
             + "</li>" for r in missing_aa)
@@ -1076,6 +1238,11 @@ def main():
         ap.error("--sub-price must be > 0")
 
     # 0. Go catalog: always parsed fresh from the live docs. No snapshot, no cache.
+    # The docs usage-limits tables are the source of truth for which models
+    # exist and what their limits/prices are. The live endpoint below is a
+    # cross-check only (warn) — served ids with no docs tables are NOT
+    # invented into the report, since without published limits/prices there
+    # is nothing fair to score them on.
     go_models, go_src = fetch_go_catalog(url=args.go_docs_url)
     if not go_models:
         sys.exit("ERROR: Go catalog is empty — docs parse returned no models.")
@@ -1108,7 +1275,8 @@ def main():
     else:
         aa_models = fetch_aa_models(args.api_key)
 
-    # 2. live endpoint cross-check (always fresh, never cached)
+    # 2. live endpoint cross-check (always fresh, never cached; docs is
+    # source of truth — extras are reported, never invented into the report)
     try:
         live_ids = fetch_zen_model_ids()
     except Exception as e:
@@ -1131,13 +1299,36 @@ def main():
             aa_note = f"AA name: {matched_display}"
         else:
             aa_note = ""
+        if (gm.tok_in is None or gm.tok_cache is None or gm.tok_out is None
+                or gm.price_in is None or gm.price_out is None or gm.price_cache is None):
+            # Free promo rows (all prices 0.0) cost $0 even without a
+            # published token profile; anything else is genuinely unknown.
+            if (gm.price_in == 0.0 and gm.price_out == 0.0 and gm.price_cache == 0.0):
+                cost_req = 0.0
+            else:
+                cost_req = None
+        else:
+            cost_req = (gm.tok_in * gm.price_in + gm.tok_cache * gm.price_cache
+                        + gm.tok_out * gm.price_out) / 1e6
+        if gm.usage_usd is None:
+            value_mult = None
+        elif isinstance(gm.usage_usd, float) and math.isinf(gm.usage_usd):
+            value_mult = math.inf
+        else:
+            value_mult = gm.usage_usd / args.sub_price
+        if (gm.req_month is None
+                or (isinstance(gm.req_month, float) and math.isinf(gm.req_month))
+                or gm.tok_in is None or gm.tok_cache is None or gm.tok_out is None):
+            tokens_month = None
+        else:
+            tokens_month = gm.req_month * (gm.tok_in + gm.tok_cache + gm.tok_out)
         # Never surface the "suggested:" guess in notes/CSV — it lives only in
         # the terminal hint and the HTML callout for genuinely unscored rows.
         rows.append(Row(
             id=gm.id, name=gm.name, req_5h=gm.req_5h, req_week=gm.req_week, req_month=gm.req_month,
-            cost_req=(gm.tok_in * gm.price_in + gm.tok_cache * gm.price_cache + gm.tok_out * gm.price_out) / 1e6,
-            value_mult=gm.usage_usd / args.sub_price,
-            tokens_month=gm.req_month * (gm.tok_in + gm.tok_cache + gm.tok_out),
+            cost_req=cost_req,
+            value_mult=value_mult,
+            tokens_month=tokens_month,
             aa_name=matched_display, match_quality=quality,
             intelligence=ev.get("artificial_analysis_intelligence_index"),
             tok_s=(aa or {}).get("median_output_tokens_per_second"),
@@ -1169,12 +1360,15 @@ def main():
 
     if live_ids is not None:
         embedded = {gm.id for gm in go_models}
-        extra = [i for i in live_ids if i not in embedded]
+        extra = sorted(i for i in live_ids if i not in embedded)
         missing = sorted(embedded - set(live_ids))
         print(f"\nLive endpoint check ({ZEN_MODELS_URL}):")
-        print(f"  {len(live_ids)} models served; docs catalog covers {len(embedded) - len(missing)} (source: {go_src})")
+        print(f"  {len(live_ids)} models served; docs catalog covers "
+              f"{len(embedded) - len(missing)} (source: {go_src})")
         if extra:
-            print(f"  ! on live endpoint but no published limits in docs: {', '.join(extra)}")
+            print(f"  ! on live endpoint but with no published usage-limits in docs "
+                  f"(not scored, not listed — see https://opencode.ai/docs/go/#usage-limits): "
+                  f"{', '.join(extra)}")
         if missing:
             print(f"  ! in catalog but NOT on live endpoint any more: {', '.join(missing)}")
         if not extra and not missing:
@@ -1184,9 +1378,21 @@ def main():
     if ranked:
         print("\nTop value (bang-for-buck = quality^0.7 × saturating quota-value^0.3, 0–100):")
         for r in sorted(ranked, key=lambda r: -r.bang)[:5]:
+            if r.req_month is None:
+                quota_s = "n/a"
+            elif isinstance(r.req_month, float) and math.isinf(r.req_month):
+                quota_s = "Unlimited"
+            else:
+                quota_s = f"{r.req_month:,} req/mo"
+            if r.value_mult is None:
+                mult_s = "n/a"
+            elif isinstance(r.value_mult, float) and math.isinf(r.value_mult):
+                mult_s = "∞ sub value"
+            else:
+                mult_s = f"{r.value_mult:.0f}x sub value"
             print(f"  {r.name:<28} bang {r.bang:>5.0f}   "
                   f"int {'—' if r.intelligence is None else f'{r.intelligence:.1f}'}   "
-                  f"{r.req_month:,} req/mo   ({r.value_mult:.0f}x sub value)")
+                  f"{quota_s}   ({mult_s})")
 
     # 5. artifacts
     charts = make_charts(rows, args.prefix, args.sub_price, args.demo)
@@ -1199,7 +1405,11 @@ def main():
         write_csv(rows, args.csv, args.sub_price)
         print(f"wrote {args.csv}")
     with open(f"{args.prefix}_data.json", "w") as f:
-        json.dump([asdict(r) for r in rows], f, indent=1)
+        # math.inf is not strict JSON — serialize Unlimited quotas/values
+        # as the string "Unlimited" so other tools can consume the file.
+        def _js(v):
+            return "Unlimited" if isinstance(v, float) and math.isinf(v) else v
+        json.dump([{k: _js(v) for k, v in asdict(r).items()} for r in rows], f, indent=1)
     print(f"wrote {args.prefix}_data.json")
     html_path = f"{args.prefix}_report.html"
     write_html(rows, charts, args.sub_price, args.demo, go_src, html_path,
