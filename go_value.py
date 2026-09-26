@@ -358,6 +358,39 @@ def has_digits(t):
     return {x for x in t if any(c.isdigit() for c in x)}
 
 
+def _is_non_reasoning(aa_entry):
+    """True if the AA entry is an explicit Non-Reasoning variant.
+
+    tokens() strips "reasoning" but keeps "non", so a plain
+    fewest-extra-tokens comparison prefers "(Non-Reasoning)" (1 extra token:
+    "non") over "(Reasoning, Max Effort)" (2 extra: "max", "effort").
+    Detect the raw marker instead so callers can deprioritise it."""
+    for label in ((aa_entry.get("name") or ""), (aa_entry.get("slug") or "")):
+        if re.search(r"\bnon[\s_\-]*reasoning\b", label, re.I):
+            return True
+    return False
+
+
+def _aa_intelligence(aa_entry):
+    """AA intelligence index as float, or -1.0 when missing/unparseable."""
+    try:
+        v = ((aa_entry or {}).get("evaluations") or {}).get("artificial_analysis_intelligence_index")
+        return float(v) if v is not None else -1.0
+    except (TypeError, ValueError):
+        return -1.0
+
+
+# Reasoning-effort markers that do NOT identify a different model, only a
+# benchmark setting for the same base model (AA splits families into
+# Non-Reasoning / low / medium / high / xhigh / max / minimal / "Max Effort"
+# ...). low/medium/high/reasoning never reach here (already in STOP_TOKENS);
+# the rest must be ignored when deciding model identity so that e.g.
+# "MiMo-V2.5" (exact) still beats "MiMo-V2.5-Pro" (+1 identity token "pro")
+# while "DeepSeek V4.1 Flash (Non-Reasoning)" and "(Reasoning, Max Effort)"
+# count as the SAME model (identity-extra 0) and are ranked by score.
+EFFORT_TOKENS = frozenset({"non", "max", "effort", "xhigh", "minimal"})
+
+
 def match_one(go_model, aa_models, overrides):
     """Return (aa_entry|None, quality, matched_name). quality in exact/fuzzy/low/none."""
     forced = overrides.get(go_model.id) or (go_model.aa_hint or None)
@@ -372,7 +405,18 @@ def match_one(go_model, aa_models, overrides):
     want = set(tokens(go_model.name))
     want_digits = has_digits(want)
     want_variant = want & VARIANT_TOKENS
-    best, best_key, best_quality = None, None, None
+    want_ident = want - EFFORT_TOKENS
+    # Collect every subset-compatible AA entry (across its name/slug labels),
+    # then rank: (1) reasoning over Non-Reasoning, (2) same-model identity
+    # ignoring effort markers, (3) highest intelligence, (4) fewest extra
+    # tokens. AA benchmarks the same base model at several reasoning efforts;
+    # the old fewest-extra-tokens rule picked e.g. "DeepSeek V4.1 Flash
+    # (Non-Reasoning)" (extra {"non"}) over "(Reasoning, Max Effort)" (extra
+    # {"max", "effort"}), understating quality 24.7 vs 39.5. Identity comes
+    # before score so "MiMo-V2.5" still beats "MiMo-V2.5-Pro" ("pro" is a
+    # real model difference, not an effort marker). The digits guard still
+    # confines candidates to the same dated snapshot.
+    cands = {}  # id(m) -> [entry, extra, sim, ident_extra]
     for m in aa_models:
         for label in (m.get("name", ""), m.get("slug", "")):
             cand = set(tokens(label))
@@ -384,13 +428,18 @@ def match_one(go_model, aa_models, overrides):
                 continue  # vision/exp/preview must agree; never score base as variant
             if want <= cand or cand <= want:
                 extra = len(cand ^ want)
-                quality = "exact" if extra == 0 else "fuzzy"
                 sim = difflib.SequenceMatcher(None, " ".join(sorted(want)), " ".join(sorted(cand))).ratio()
-                key = (extra, -sim)
-                if best_key is None or key < best_key:
-                    best, best_key, best_quality = m, key, quality
-    if best is not None:
-        return best, best_quality, best.get("name")
+                ident_extra = len((cand - EFFORT_TOKENS) ^ want_ident)
+                prev = cands.get(id(m))
+                if prev is None or (extra, -sim) < (prev[1], -prev[2]):
+                    cands[id(m)] = [m, extra, sim, ident_extra]
+    if cands:
+        def rank(item):
+            m, extra, sim, ident_extra = item
+            return (1 if _is_non_reasoning(m) else 0, ident_extra,
+                    -_aa_intelligence(m), extra, -sim)
+        best, best_extra, _, _ = min(cands.values(), key=rank)
+        return best, ("exact" if best_extra == 0 else "fuzzy"), best.get("name")
     # Nothing compatible: only suggest when digits agree, variant markers agree,
     # and at least one token overlaps — otherwise stay silent ("none").
     cands = []
