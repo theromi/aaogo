@@ -2,9 +2,10 @@
 """Compare OpenCode Go models by Artificial Analysis quality vs Go usage limits.
 
 Combines the OpenCode Go model list / usage limits (parsed fresh from the
-upstream docs MDX https://opencode.ai/docs/go/#usage-limits on every run —
+upstream docs MDX
+https://opencode.ai/v2/docs/console/go/#usage-limits on every run —
 the docs tables are the source of truth — and cross-checked against the live
-endpoint https://opencode.ai/zen/go/v1/models) with benchmark data from the
+endpoint https://opencode.ai/inference/go/v1/models) with benchmark data from the
 Artificial Analysis free API
 (https://artificialanalysis.ai/api/v2/data/llms/models, key required).
 
@@ -51,7 +52,7 @@ from string import Template
 
 @dataclass
 class GoModel:
-    id: str                 # model id on opencode.ai/zen/go (config: opencode-go/<id>)
+    id: str                 # model id on OpenCode Go (config: opencode-go/<id>)
     name: str               # display name in docs
     # Quotas: int, math.inf for docs "Unlimited" promo rows, None when the
     # docs publish no limit (e.g. endpoint-only models not yet documented).
@@ -72,12 +73,16 @@ class GoModel:
     trains: bool = False    # docs ## Privacy table: model trains on your prompts
     retention: str = ""     # docs ## Privacy table: data retention (e.g. "0 days")
 
-ZEN_MODELS_URL = "https://opencode.ai/zen/go/v1/models"
+GO_MODELS_URL = "https://opencode.ai/inference/go/v1/models"
 # Live docs source (upstream OpenCode docs). Override with --go-docs-url
 # only if upstream moves. No fallback snapshot exists: a failed fetch
 # is a fatal error so reports never reflect stale data.
-GO_DOCS_MDX_URL = ("https://raw.githubusercontent.com/sst/opencode/dev/"
-                   "packages/web/src/content/docs/go.mdx")
+GO_DOCS_MDX_URL = ("https://raw.githubusercontent.com/anomalyco/opencode/dev/"
+                   "services/www/src/docs/content/console/go.mdx")
+# The docs publish one table set per plan inside <PlanTabs> slots
+# (slot="go" and slot="go-plus"), with identical headers but different
+# limits. Only the base Go plan is scored; go-plus tables are ignored.
+GO_PLAN_SLOT = "go"
 AA_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 AA_ATTRIBUTION = "Benchmarks: artificialanalysis.ai"
 DEFAULT_OVERRIDES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aa_match_overrides.json")
@@ -103,9 +108,9 @@ def http_get_json(url, headers=None, timeout=30):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def fetch_zen_model_ids():
+def fetch_go_model_ids():
     """Live list of model ids currently served by OpenCode Go (public)."""
-    data = http_get_json(ZEN_MODELS_URL)
+    data = http_get_json(GO_MODELS_URL)
     return sorted(m["id"] for m in data.get("data", []))
 
 
@@ -211,16 +216,24 @@ def _parse_money(s):
 
 
 def _md_tables(text):
-    tables, lines, i = [], text.splitlines(), 0
+    """All markdown tables in the docs, each tagged with its enclosing
+    <div slot="..."> (None when the table is not inside a plan slot)."""
+    tables, lines, i, slot = [], text.splitlines(), 0, None
     while i < len(lines):
+        line = lines[i]
+        m = re.search(r'<div\s+slot="([^"]+)"', line)
+        if m:
+            slot = m.group(1)
+        elif slot is not None and "</div>" in line:
+            slot = None
         sep = lines[i + 1].strip() if i + 1 < len(lines) else ""
-        if (lines[i].strip().startswith("|") and "-" in sep
+        if (line.strip().startswith("|") and "-" in sep
                 and set(sep) <= set("|-: ")):
-            hdr, rows, j = _md_cells(lines[i]), [], i + 2
+            hdr, rows, j = _md_cells(line), [], i + 2
             while j < len(lines) and lines[j].strip().startswith("|"):
                 rows.append(_md_cells(lines[j]))
                 j += 1
-            tables.append((hdr, rows))
+            tables.append((hdr, rows, slot))
             i = j
         else:
             i += 1
@@ -244,7 +257,9 @@ def expand_shared_names(name):
 def parse_go_catalog(mdx):
     """Build [GoModel] from the docs MDX. Returns (models, skipped_names)."""
     reqs, prices, profiles, ids, notes, privacy = {}, {}, {}, {}, {}, {}
-    for hdr, rows in _md_tables(mdx):
+    for hdr, rows, slot in _md_tables(mdx):
+        if slot is not None and slot != GO_PLAN_SLOT:
+            continue  # per-plan table set — this project scores only the base Go plan
         h = [x.lower() for x in hdr]
 
         def col(sub):
@@ -927,7 +942,7 @@ $tbody
 <dt>Privacy</dt><dd>From the Go docs <i>Privacy</i> table: whether the provider trains models on your prompts, plus data retention. The checkbox above (on by default) swaps charts, cards and leaderboard rows to versions without the flagged <b>trains</b> models.</dd>
 </dl>
 <footer>
-Sources: <a href="https://opencode.ai/docs/go/">OpenCode Go docs</a> &amp; the <code>zen/go/v1/models</code> endpoint
+Sources: <a href="https://opencode.ai/v2/docs/console/go/">OpenCode Go docs</a> &amp; the <code>inference/go/v1/models</code> endpoint
 (catalog: $go_src)
 &middot; benchmarks &amp; speed: <a href="https://artificialanalysis.ai/">Artificial Analysis</a>
 (attribution required by their free-API terms). Generated by <code>go_value.py</code> on $generated.
@@ -1278,9 +1293,9 @@ def main():
     # 2. live endpoint cross-check (always fresh, never cached; docs is
     # source of truth — extras are reported, never invented into the report)
     try:
-        live_ids = fetch_zen_model_ids()
+        live_ids = fetch_go_model_ids()
     except Exception as e:
-        print(f"[zen] warning: could not reach {ZEN_MODELS_URL}: {e}", file=sys.stderr)
+        print(f"[go models] warning: could not reach {GO_MODELS_URL}: {e}", file=sys.stderr)
         live_ids = None
 
     # 3. build rows
@@ -1362,12 +1377,12 @@ def main():
         embedded = {gm.id for gm in go_models}
         extra = sorted(i for i in live_ids if i not in embedded)
         missing = sorted(embedded - set(live_ids))
-        print(f"\nLive endpoint check ({ZEN_MODELS_URL}):")
+        print(f"\nLive endpoint check ({GO_MODELS_URL}):")
         print(f"  {len(live_ids)} models served; docs catalog covers "
               f"{len(embedded) - len(missing)} (source: {go_src})")
         if extra:
             print(f"  ! on live endpoint but with no published usage-limits in docs "
-                  f"(not scored, not listed — see https://opencode.ai/docs/go/#usage-limits): "
+                  f"(not scored, not listed — see https://opencode.ai/v2/docs/console/go/#usage-limits): "
                   f"{', '.join(extra)}")
         if missing:
             print(f"  ! in catalog but NOT on live endpoint any more: {', '.join(missing)}")
